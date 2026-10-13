@@ -2,6 +2,7 @@
  *  RaptorScope  -  3D Mesh Parsers (Room, Door, EMD)
  *═══════════════════════════════════════════════════════════════════*/
 #include "formats/mesh.h"
+#include "formats/scd.h"
 #include "core/lzss.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -26,6 +27,21 @@ static RGBA8 avg_colors(const u8 cols[][3], int n)
     int g = (int)(sg / (float)n * bst); if (g > 255) g = 255;
     int b = (int)(sb / (float)n * bst); if (b > 255) b = 255;
     return RGBA8((u8)r, (u8)g, (u8)b, 255);
+}
+
+/*─── Gouraud corner colours ─────────────────────────────────────
+   Room and door faces are Gouraud-textured (command 0x34/0x3C, 0x36/0x3E
+   semi-transparent; 41% of placed faces across the game vary corner to
+   corner) and store an RGB per vertex; the GPU tints each texel by the
+   colour interpolated across the face.  c0..c2 are the source vertices of the
+   tri's corners, in the same order as its uv.  ST108's wall box is one
+   grey texel shaded by corner colours 30..121. */
+static void set_vcols(MeshTri& t, const u8 cols[][3], int c0, int c1, int c2)
+{
+    const int src[3] = { c0, c1, c2 };
+    for (int k = 0; k < 3; k++)
+        for (int ch = 0; ch < 3; ch++) t.vcol[k][ch] = cols[src[k]][ch];
+    t.gouraud = 1;
 }
 
 /*═══════════════════════════════════════════════════════════════════
@@ -221,13 +237,15 @@ bool parse_rdt_layout(const u8* dec, size_t dec_size, u32 base,
         /* Empty section: skip header only */
         if (c1 == 0 && c2 == 0) { off += 12; continue; }
 
-        /* Validate the code byte of the first face to confirm GT3/GT4 */
+        /* The first face's GPU command must be a polygon of the right shape:
+           0x20-0x3F, bit 3 set for quads.  Any shading, texturing or
+           semi-transparency (e.g. 0x36, ST301) is allowed. */
         if (c1 > 0) {
             u8 code = dec[p1 + 24 + 7]; /* tail[7] of first tri */
-            if (code != 0x34 && code != 0x30 && code != 0x24) break;
+            if ((code & 0xE8) != 0x20) break;
         } else if (c2 > 0) {
             u8 code = dec[p2 + 32 + 7]; /* tail[7] of first quad */
-            if (code != 0x3C && code != 0x3E && code != 0x38 && code != 0x2C) break;
+            if ((code & 0xE8) != 0x28) break;
         }
 
         RdtMeshSection& sec = layout.sections[layout.section_count++];
@@ -280,6 +298,16 @@ bool parse_rdt_layout_from_entry(const u8* data, size_t size,
 
     u32 base = ((u32)(ey & 0x7FFF) << 16) | (u32)ex | 0x80000000u;
     return parse_rdt_layout(dec.data, dec.size, base, layout);
+}
+
+bool is_raw_rdt_entry(const DatEntry& e)
+{
+    if (e.type != DAT_DATA || !(e.y & 0x8000) || !e.data || e.size < 0x20)
+        return false;
+    u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+    RdtLayout layout;
+    return parse_rdt_layout(e.data, e.size, base, layout) &&
+           (layout.section_count > 0 || layout.emd_count > 0);
 }
 
 /*─── Detect room vs object mesh layout ──────────────────────────*/
@@ -361,7 +389,6 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
 
             s16 vs[3][3];
             u8  uvs[3][2];
-            bool valid = true;
             for (int vi = 0; vi < 3; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -369,11 +396,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 24);
             u16 cl = rd_u16(dec_data + o + 26);
@@ -395,6 +418,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t = {};
             t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
             t.color = avg_colors(cols, 3);
+            set_vcols(t, cols, 0, 2, 1);
             t.tpage = tp; t.clut = cl;
             t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
             t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
@@ -409,7 +433,6 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
 
             s16 vs[4][3];
             u8  uvs[4][2];
-            bool valid = true;
             for (int vi = 0; vi < 4; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -417,11 +440,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 32);
             u16 cl = rd_u16(dec_data + o + 34);
@@ -445,6 +464,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t1 = {};
             t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;
             t1.color = c; t1.tpage = tp; t1.clut = cl;
+            set_vcols(t1, cols, 0, 2, 1);
             t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
             t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
             t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
@@ -453,6 +473,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t2 = {};
             t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;
             t2.color = c; t2.tpage = tp; t2.clut = cl;
+            set_vcols(t2, cols, 1, 2, 3);
             t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
             t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
             t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
@@ -477,6 +498,130 @@ bool parse_room_mesh(const u8* data, size_t size, u32 base_addr, Mesh& mesh)
     return parse_room_mesh_dec(dec.data, dec.size, base_addr, mesh);
 }
 
+/*─── Faces the game draws over a face in front of them ──────────
+   The game sorts a model slot's faces by its render mode (0x23 byte 3;
+   DINO.exe 0x44DA6D): mode 0 by each face's nearest vertex, mode 1 by its
+   farthest, and modes 2 and 3 put the whole section at one depth (0x5F1AE0).
+   0x5F2DD0 inserts each face at the head of its ordering-table bucket, and
+   the quads go in before the triangles, so in a mode 2/3 section the first
+   face is drawn last, on top, whatever its depth.  ST101's windows are quads
+   30-37 of slot 0, 22 units behind wall quads (193 on) that have no hole for
+   them: the game draws the windows, a depth buffer hides them.  Each face
+   that lies just behind a parallel face the game draws before it, and is
+   mostly covered by it, is moved 2 units in front of it.  Only gaps up to 40
+   units and a quarter of the face's width count: ST30A's 25-wide strips 50
+   apart sit side by side on screen, not over each other.  f lists the
+   section's faces in the order the game adds them; v holds their vertices in
+   viewer space, a quad's in PSX order (0 1 / 2 3). */
+struct SecFace { u32 v0, nv; };
+
+static void raise_recessed_faces(MeshVert* v, const SecFace* f, int n)
+{
+    if (n < 2) return;
+    struct Plane { f32 n[3], d, width, c[3]; bool ok; };
+    Plane* pl   = (Plane*)calloc(n, sizeof(Plane));
+    f32*   push = (f32*)calloc(n, sizeof(f32));
+    if (!pl || !push) { free(pl); free(push); return; }
+    static const int loop3[3] = { 0, 1, 2 }, loop4[4] = { 0, 1, 3, 2 };
+
+    for (int i = 0; i < n; i++) {
+        Plane& p = pl[i];
+        const MeshVert* q = v + f[i].v0;
+        const int* loop = f[i].nv == 4 ? loop4 : loop3;
+        /* Front normal: the triangles wind v0, v2, v1 */
+        f32 e1[3] = { q[2].x - q[0].x, q[2].y - q[0].y, q[2].z - q[0].z };
+        f32 e2[3] = { q[1].x - q[0].x, q[1].y - q[0].y, q[1].z - q[0].z };
+        p.n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        p.n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        p.n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        f32 area = sqrtf(p.n[0] * p.n[0] + p.n[1] * p.n[1] + p.n[2] * p.n[2]);
+        if (area < 0.001f) continue;
+        for (int k = 0; k < 3; k++) p.n[k] /= area;
+        p.d = p.n[0] * q[0].x + p.n[1] * q[0].y + p.n[2] * q[0].z;
+        area *= 0.5f;
+        if (f[i].nv == 4) {
+            f32 g1[3] = { q[1].x - q[3].x, q[1].y - q[3].y, q[1].z - q[3].z };
+            f32 g2[3] = { q[2].x - q[3].x, q[2].y - q[3].y, q[2].z - q[3].z };
+            f32 cx = g1[1] * g2[2] - g1[2] * g2[1];
+            f32 cy = g1[2] * g2[0] - g1[0] * g2[2];
+            f32 cz = g1[0] * g2[1] - g1[1] * g2[0];
+            area += 0.5f * sqrtf(cx * cx + cy * cy + cz * cz);
+        }
+        /* Width: area over the longest edge (a rectangle's shorter side) */
+        f32 longest = 0;
+        p.ok = true;
+        for (u32 k = 0; k < f[i].nv; k++) {
+            const MeshVert& a = q[loop[k]];
+            const MeshVert& b = q[loop[(k + 1) % f[i].nv]];
+            f32 dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+            f32 e = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (e > longest) longest = e;
+            if (fabsf(p.n[0] * a.x + p.n[1] * a.y + p.n[2] * a.z - p.d) > 1.0f) p.ok = false;
+            p.c[0] += a.x / f[i].nv; p.c[1] += a.y / f[i].nv; p.c[2] += a.z / f[i].nv;
+        }
+        p.width = area / longest;
+    }
+
+    for (int i = 0; i < n; i++) {
+        const Plane& a = pl[i];
+        if (!a.ok) continue;
+        f32 limit = a.width / 4.0f;
+        if (limit > 40.0f) limit = 40.0f;
+        if (limit < 1.0f) continue;
+        for (int j = i + 1; j < n; j++) {
+            const Plane& b = pl[j];
+            if (!b.ok) continue;
+            if (a.n[0] * b.n[0] + a.n[1] * b.n[1] + a.n[2] * b.n[2] < 0.999f) continue;
+            /* Behind b: every vertex 0.5..limit units on b's back side */
+            f32 nearest = -1e9f, deepest = 1e9f;
+            for (u32 k = 0; k < f[i].nv; k++) {
+                const MeshVert& q = v[f[i].v0 + k];
+                f32 s = b.n[0] * q.x + b.n[1] * q.y + b.n[2] * q.z - b.d;
+                if (s > nearest) nearest = s;
+                if (s < deepest) deepest = s;
+            }
+            if (nearest > -0.5f || deepest < -limit) continue;
+            /* ...and mostly covered by b: of its centre and the points halfway
+               to its corners, at least half on the inner side of b's edges */
+            const MeshVert* q = v + f[j].v0;
+            const int* loop = f[j].nv == 4 ? loop4 : loop3;
+            u32 hits = 0;
+            for (u32 s = 0; s <= f[i].nv; s++) {
+                f32 pt[3] = { a.c[0], a.c[1], a.c[2] };
+                if (s < f[i].nv) {
+                    const MeshVert& w = v[f[i].v0 + s];
+                    pt[0] = (pt[0] + w.x) * 0.5f; pt[1] = (pt[1] + w.y) * 0.5f; pt[2] = (pt[2] + w.z) * 0.5f;
+                }
+                bool inside = true;
+                for (u32 k = 0; k < f[j].nv && inside; k++) {
+                    const MeshVert& e0 = q[loop[k]];
+                    const MeshVert& e1 = q[loop[(k + 1) % f[j].nv]];
+                    f32 ex = e1.x - e0.x, ey = e1.y - e0.y, ez = e1.z - e0.z;
+                    f32 px = pt[0] - e0.x, py = pt[1] - e0.y, pz = pt[2] - e0.z;
+                    f32 side = b.n[0] * (ey * pz - ez * py) + b.n[1] * (ez * px - ex * pz) +
+                               b.n[2] * (ex * py - ey * px);
+                    if (side > 0) inside = false;
+                }
+                if (inside) hits++;
+            }
+            if (hits * 2 <= f[i].nv + 1) continue;
+            if (2.0f - deepest > push[i]) push[i] = 2.0f - deepest;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (push[i] <= 0) continue;
+        for (u32 k = 0; k < f[i].nv; k++) {
+            MeshVert& q = v[f[i].v0 + k];
+            q.x += pl[i].n[0] * push[i];
+            q.y += pl[i].n[1] * push[i];
+            q.z += pl[i].n[2] * push[i];
+        }
+    }
+    free(pl);
+    free(push);
+}
+
 /*═══════════════════════════════════════════════════════════════════
  *  Apply 0x23 Section Transforms (Instancing)
  *
@@ -493,6 +638,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
     /* Temporary buffers for new geometry */
     Array<MeshVert> new_verts;
     Array<MeshTri>  new_tris;
+    Array<SecFace>  sec_faces;
     new_verts.reserve(8192);
     new_tris.reserve(8192);
 
@@ -542,60 +688,12 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
             if (tri_end > dec_size || quad_end > dec_size) break;
             if (c1 == 0 && c2 == 0) { off += 12; continue; }
 
-            /* Parse triangles with offset */
-            for (int i = 0; i < (int)c1; i++) {
-                size_t o = p1 + (size_t)i * 40;
-                if (o + 40 > dec_size) break;
-                s16 vs[3][3]; u8 uvs[3][2]; bool valid = true;
-                for (int vi = 0; vi < 3; vi++) {
-                    vs[vi][0] = rd_s16(dec + o + vi*8);
-                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
-                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
-                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
-                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
-                    uvs[vi][1] = (u8)(uv_raw >> 8);
-                    for (int a = 0; a < 3; a++)
-                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
-                }
-                if (!valid) continue;
-                u16 tp = rd_u16(dec + o + 24);
-                u16 cl = rd_u16(dec + o + 26);
-                u8 cols[3][3];
-                for (int ci = 0; ci < 3; ci++) {
-                    cols[ci][0] = dec[o+28+ci*4]; cols[ci][1] = dec[o+28+ci*4+1]; cols[ci][2] = dec[o+28+ci*4+2];
-                }
-                u32 bi = (u32)new_verts.count;
-                for (int vi = 0; vi < 3; vi++) {
-                    f32 lx = (f32)vs[vi][0];
-                    f32 ly = (f32)vs[vi][1];
-                    f32 lz = (f32)vs[vi][2];
-                    if (has_rot) {
-                        f32 rx2 = cr * lx + sr * lz;
-                        f32 rz2 = -sr * lx + cr * lz;
-                        lx = rx2; lz = rz2;
-                    }
-                    MeshVert mv = {};
-                    mv.x = -lx + ox;
-                    mv.y = -ly + oy;
-                    mv.z =  lz + oz;
-                    new_verts.push(mv);
-                }
-                MeshTri t = {};
-                t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
-                t.color = avg_colors(cols, 3);
-                t.tpage = tp; t.clut = cl;
-                t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
-                t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
-                t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
-                t.src_off = xf.section_off;
-                new_tris.push(t);
-            }
-
-            /* Parse quads with offset */
+            /* Quads before triangles, the order the game adds them in */
+            sec_faces.clear();
             for (int i = 0; i < (int)c2; i++) {
                 size_t o = p2 + (size_t)i * 52;
                 if (o + 52 > dec_size) break;
-                s16 vs[4][3]; u8 uvs[4][2]; bool valid = true;
+                s16 vs[4][3]; u8 uvs[4][2];
                 for (int vi = 0; vi < 4; vi++) {
                     vs[vi][0] = rd_s16(dec + o + vi*8);
                     vs[vi][1] = rd_s16(dec + o + vi*8+2);
@@ -603,10 +701,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                     u16 uv_raw = rd_u16(dec + o + vi*8+6);
                     uvs[vi][0] = (u8)(uv_raw & 0xFF);
                     uvs[vi][1] = (u8)(uv_raw >> 8);
-                    for (int a = 0; a < 3; a++)
-                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
                 }
-                if (!valid) continue;
                 u16 tp = rd_u16(dec + o + 32);
                 u16 cl = rd_u16(dec + o + 34);
                 u8 cols[4][3];
@@ -614,6 +709,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                     cols[ci][0] = dec[o+36+ci*4]; cols[ci][1] = dec[o+36+ci*4+1]; cols[ci][2] = dec[o+36+ci*4+2];
                 }
                 u32 bi = (u32)new_verts.count;
+                SecFace sf = { bi, 4 }; sec_faces.push(sf);
                 RGBA8 c = avg_colors(cols, 4);
                 for (int vi = 0; vi < 4; vi++) {
                     f32 lx = (f32)vs[vi][0];
@@ -633,20 +729,73 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 MeshTri t1 = {};
                 t1.idx[0]=bi; t1.idx[1]=bi+2; t1.idx[2]=bi+1;
                 t1.color=c; t1.tpage=tp; t1.clut=cl;
+                set_vcols(t1, cols, 0, 2, 1);
                 t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
                 t1.uv[1][0]=uvs[2][0]; t1.uv[1][1]=uvs[2][1];
                 t1.uv[2][0]=uvs[1][0]; t1.uv[2][1]=uvs[1][1];
-                t1.src_off = xf.section_off;
+                t1.src_off = xf.section_off; t1.slot = xf.slot;
                 new_tris.push(t1);
                 MeshTri t2 = {};
                 t2.idx[0]=bi+1; t2.idx[1]=bi+2; t2.idx[2]=bi+3;
                 t2.color=c; t2.tpage=tp; t2.clut=cl;
+                set_vcols(t2, cols, 1, 2, 3);
                 t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
                 t2.uv[1][0]=uvs[2][0]; t2.uv[1][1]=uvs[2][1];
                 t2.uv[2][0]=uvs[3][0]; t2.uv[2][1]=uvs[3][1];
-                t2.src_off = xf.section_off;
+                t2.src_off = xf.section_off; t2.slot = xf.slot;
                 new_tris.push(t2);
             }
+
+            /* Then triangles */
+            for (int i = 0; i < (int)c1; i++) {
+                size_t o = p1 + (size_t)i * 40;
+                if (o + 40 > dec_size) break;
+                s16 vs[3][3]; u8 uvs[3][2];
+                for (int vi = 0; vi < 3; vi++) {
+                    vs[vi][0] = rd_s16(dec + o + vi*8);
+                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
+                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
+                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
+                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                    uvs[vi][1] = (u8)(uv_raw >> 8);
+                }
+                u16 tp = rd_u16(dec + o + 24);
+                u16 cl = rd_u16(dec + o + 26);
+                u8 cols[3][3];
+                for (int ci = 0; ci < 3; ci++) {
+                    cols[ci][0] = dec[o+28+ci*4]; cols[ci][1] = dec[o+28+ci*4+1]; cols[ci][2] = dec[o+28+ci*4+2];
+                }
+                u32 bi = (u32)new_verts.count;
+                SecFace sf = { bi, 3 }; sec_faces.push(sf);
+                for (int vi = 0; vi < 3; vi++) {
+                    f32 lx = (f32)vs[vi][0];
+                    f32 ly = (f32)vs[vi][1];
+                    f32 lz = (f32)vs[vi][2];
+                    if (has_rot) {
+                        f32 rx2 = cr * lx + sr * lz;
+                        f32 rz2 = -sr * lx + cr * lz;
+                        lx = rx2; lz = rz2;
+                    }
+                    MeshVert mv = {};
+                    mv.x = -lx + ox;
+                    mv.y = -ly + oy;
+                    mv.z =  lz + oz;
+                    new_verts.push(mv);
+                }
+                MeshTri t = {};
+                t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
+                t.color = avg_colors(cols, 3);
+                set_vcols(t, cols, 0, 2, 1);
+                t.tpage = tp; t.clut = cl;
+                t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
+                t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
+                t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
+                t.src_off = xf.section_off; t.slot = xf.slot;
+                new_tris.push(t);
+            }
+
+            if (xf.render_mode == 2 || xf.render_mode == 3)
+                raise_recessed_faces(new_verts.items, sec_faces.items, (int)sec_faces.count);
             off = quad_end;
             sec_done++;
         }
@@ -733,6 +882,7 @@ bool parse_door_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
         MeshTri t = {};
         t.idx[0] = bi; t.idx[1] = bi+1; t.idx[2] = bi+2;
         t.color = avg_colors(cols, 3); t.tpage = tp; t.clut = cl;
+        set_vcols(t, cols, 0, 1, 2);
         for (int vi = 0; vi < 3; vi++) {
             t.uv[vi][0] = uvs[vi][0]; t.uv[vi][1] = uvs[vi][1];
         }
@@ -774,12 +924,14 @@ bool parse_door_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
         }
         MeshTri t1 = {}, t2 = {};
         t1.idx[0]=bi; t1.idx[1]=bi+1; t1.idx[2]=bi+2; t1.color=c; t1.tpage=tp; t1.clut=cl;
+        set_vcols(t1, cols, 0, 1, 2);
         t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
         t1.uv[1][0]=uvs[1][0]; t1.uv[1][1]=uvs[1][1];
         t1.uv[2][0]=uvs[2][0]; t1.uv[2][1]=uvs[2][1];
         tris.push(t1);
 
         t2.idx[0]=bi+1; t2.idx[1]=bi+3; t2.idx[2]=bi+2; t2.color=c; t2.tpage=tp; t2.clut=cl;
+        set_vcols(t2, cols, 1, 3, 2);
         t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
         t2.uv[1][0]=uvs[3][0]; t2.uv[1][1]=uvs[3][1];
         t2.uv[2][0]=uvs[2][0]; t2.uv[2][1]=uvs[2][1];
@@ -1782,6 +1934,17 @@ bool is_mips_code_dec(const u8* dec_data, size_t dec_size)
 {
     if (dec_size < 64) return false;
 
+    /* A room RDT starts with its table pointers (ptr[0..6]), all PSX RAM
+       addresses; as code that would be seven LB instructions in a row.
+       Without this, mesh data after the table that happens to look like
+       branches marked 13 rooms (ST304, ST504, ST611, ...) as code. */
+    int ram_ptrs = 0;
+    for (int i = 0; i < 7; i++) {
+        u32 p = rd_u32(dec_data + i * 4);
+        if (p >= 0x80000000u && p < 0x80200000u) ram_ptrs++;
+    }
+    if (ram_ptrs == 7) return false;
+
     int real_mips = 0;
     int nops = 0;
     int total = 0;
@@ -2141,7 +2304,6 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
 
             s16 vs[3][3];
             u8  uvs[3][2];
-            bool valid = true;
             for (int vi = 0; vi < 3; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -2149,11 +2311,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 24);
             u16 cl = rd_u16(dec_data + o + 26);
@@ -2185,6 +2343,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t.src_off = (u32)off;
             t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
             t.color = avg_colors(cols, 3);
+            set_vcols(t, cols, 0, 2, 1);
             t.tpage = tp; t.clut = cl;
             t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
             t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
@@ -2199,7 +2358,6 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
 
             s16 vs[4][3];
             u8  uvs[4][2];
-            bool valid = true;
             for (int vi = 0; vi < 4; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -2207,11 +2365,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 32);
             u16 cl = rd_u16(dec_data + o + 34);
@@ -2244,6 +2398,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t1.src_off = (u32)off;
             t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;  /* reversed for X negate */
             t1.color = c; t1.tpage = tp; t1.clut = cl;
+            set_vcols(t1, cols, 0, 2, 1);
             t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
             t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
             t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
@@ -2253,6 +2408,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t2.src_off = (u32)off;
             t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;  /* reversed */
             t2.color = c; t2.tpage = tp; t2.clut = cl;
+            set_vcols(t2, cols, 1, 2, 3);
             t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
             t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
             t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
@@ -2521,12 +2677,17 @@ bool export_mesh_obj(const char* path, const Mesh& mesh)
     FILE* f = fopen(path, "w");
     if (!f) return false;
 
+    /* Game units are about a millimetre; write metres, as GLB export does,
+       so a room imports at its real size instead of kilometres across. */
+    const f32 unit = 0.001f;
+
     fprintf(f, "# RaptorScope - Dino Crisis Mesh Export\n");
-    fprintf(f, "# Vertices: %d  Faces: %d\n\n", mesh.vert_count, mesh.tri_count);
+    fprintf(f, "# Vertices: %d  Faces: %d  Units: metres\n\n", mesh.vert_count, mesh.tri_count);
 
     /* Vertices with positions (transforms already baked into mesh.verts) */
     for (int i = 0; i < mesh.vert_count; i++)
-        fprintf(f, "v %f %f %f\n", mesh.verts[i].x, mesh.verts[i].y, mesh.verts[i].z);
+        fprintf(f, "v %f %f %f\n", mesh.verts[i].x * unit, mesh.verts[i].y * unit,
+                mesh.verts[i].z * unit);
 
     fprintf(f, "\n");
 
@@ -2758,60 +2919,324 @@ const char* get_bone_name(int bone_count, int bone_idx)
  *    - Floor zones (ptr[6])         → trigger/transition quads
  *═══════════════════════════════════════════════════════════════════*/
 
-/* Opcode 0x28 size lookup by type field (byte[2]) */
-static int scd_op28_size(u8 type) {
-    static const int tbl[] = {48,40,32,36,44,32,32,52,32,32,32,32};
-    return (type < 12) ? tbl[type] : 32;
+/* Section placements: every 0x23 opcode (model slot = section at a
+   position) and every item pickup zone (0x28 type 4) that shows a model.
+   The linear script walk loses sync on some scripts and misses
+   placements, so scan the whole script area instead.  Opcodes start on
+   4-byte boundaries from the script base, and a candidate only counts
+   when its pointer lands on a valid section header, so false hits are
+   not a concern.  The same section at the same place is kept once.
+
+   Scripts then often adjust a placed model: 0x22 03 <slot> selects model
+   slot <slot> as the work target, then 0x2A sets one of its fields (field
+   3/4/5 = x/y/z, 6/7/8 = rotation; sub_47416C), 0x36 sets x/y/z and 0x37
+   the rotation.  Item models rely on this, e.g. ST302 lifts its DDK onto
+   the desk with y = -950.  The writes up to the next work target are
+   applied to the slot's latest placement; positions beyond +/-30000 are
+   scripts moving a model out of view and are skipped. */
+static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
+                                    size_t scd_base, size_t meta_min,
+                                    RdtSceneOverlay& ov)
+{
+    int slot_xf[256];
+    for (int i = 0; i < 256; i++) slot_xf[i] = -1;
+
+    for (size_t pc = scd_base; pc + 32 <= dec_size && ov.n_xforms < 64; pc += 4) {
+        u8 op = dec[pc];
+        u32 sec_off;
+        RdtSectionXform x;
+        memset(&x, 0, sizeof(x));
+        if (op == 0x22 && dec[pc + 1] == 3 && dec[pc + 3] == 0) {
+            int xi = slot_xf[dec[pc + 2]];
+            size_t q = pc + 4;
+            for (int n = 0; xi >= 0 && n < 32 && q + 8 <= dec_size; n++) {
+                u8 qop = dec[q];
+                if (qop == 0x22) break;              /* new work target */
+                RdtSectionXform& t = ov.xforms[xi];
+                if (qop == 0x2A) {
+                    s16 v = rd_s16(dec + q + 4);
+                    switch (dec[q + 2]) {
+                    case 3: if (v > -30000 && v < 30000) t.px = v; break;
+                    case 4: if (v > -30000 && v < 30000) t.py = v; break;
+                    case 5: if (v > -30000 && v < 30000) t.pz = v; break;
+                    case 6: t.rx = v; break;
+                    case 7: t.ry = v; break;
+                    case 8: t.rz = v; break;
+                    }
+                } else if (qop == 0x36 || qop == 0x37) {
+                    /* 0x36 sets x/y/z (fields 3-5), 0x37 the rotation (6-8) */
+                    s16 a = rd_s16(dec + q + 2), b = rd_s16(dec + q + 4), c = rd_s16(dec + q + 6);
+                    if (qop == 0x37) { t.rx = a; t.ry = b; t.rz = c; }
+                    else if (a > -30000 && a < 30000 && b > -30000 && b < 30000 &&
+                             c > -30000 && c < 30000) { t.px = a; t.py = b; t.pz = c; }
+                }
+                int adv = scd_inst_size(dec, dec_size, q);
+                if (adv == 0) break;
+                q += (size_t)adv;
+            }
+            continue;
+        }
+        if (op == 0x23) {
+            sec_off = rd_u32(dec + pc + 8) - base;
+            x.slot        = dec[pc + 1];
+            x.flags       = dec[pc + 2];
+            x.render_mode = dec[pc + 3];
+            x.ot_depth    = rd_u16(dec + pc + 4);
+            x.px = rd_s16(dec + pc + 12);
+            x.py = rd_s16(dec + pc + 14);
+            x.pz = rd_s16(dec + pc + 16);
+            x.rx = rd_s16(dec + pc + 18);
+            x.ry = rd_s16(dec + pc + 20);
+            x.rz = rd_s16(dec + pc + 22);
+        } else if (op == 0x28 && dec[pc + 2] == 4 && pc + 44 <= dec_size &&
+                   dec[pc + 34] != 0xFF) {
+            /* Item pickup zone: model slot at +34, section at +36.  The
+               game (sub_426DFC -> sub_448E3B) puts the model on the floor
+               (y = 0) at the midpoint of zone corners 0 and 2, and spins
+               it about Y while the item has not been picked up. */
+            sec_off = rd_u32(dec + pc + 36) - base;
+            s16 a0 = rd_s16(dec + pc + 4);
+            s16 a1 = rd_s16(dec + pc + 6);
+            s16 a4 = rd_s16(dec + pc + 12);
+            s16 a5 = rd_s16(dec + pc + 14);
+            x.slot = dec[pc + 34];
+            x.px = a4 + (s16)((a0 - a4) / 2);
+            x.pz = a5 + (s16)((a1 - a5) / 2);
+        } else {
+            continue;
+        }
+
+        if (sec_off < 0x1C || sec_off + 12 > meta_min) continue;
+        u32 sp1 = rd_u32(dec + sec_off) - base;
+        u32 sp2 = rd_u32(dec + sec_off + 4) - base;
+        u16 sc1 = rd_u16(dec + sec_off + 8);
+        u16 sc2 = rd_u16(dec + sec_off + 10);
+        if (sp1 >= dec_size || sp2 >= dec_size || sc1 > 5000 || sc2 > 5000) continue;
+        if ((size_t)sp1 + (size_t)sc1 * 40 > dec_size ||
+            (size_t)sp2 + (size_t)sc2 * 52 > dec_size) continue;
+        x.section_off = sec_off;
+
+        int found = -1;
+        for (int i = 0; i < ov.n_xforms && found < 0; i++) {
+            const RdtSectionXform& o = ov.xforms[i];
+            if (o.section_off == x.section_off &&
+                o.px == x.px && o.py == x.py && o.pz == x.pz &&
+                o.rx == x.rx && o.ry == x.ry && o.rz == x.rz) found = i;
+        }
+        if (found < 0) { found = ov.n_xforms; ov.xforms[ov.n_xforms++] = x; }
+        slot_xf[x.slot] = found;
+    }
 }
 
-/* Compute opcode advance and whether it terminates the walk.
-   Returns advance amount in bytes, or 0 if we should stop. */
-static int scd_opcode_advance(const u8* dec, size_t dec_size, size_t pc) {
-    if (pc >= dec_size) return 0;
-    u8 op = dec[pc];
+/* Trigger zones: every 0x28 opcode in the script area.  The script walk
+   stops at the first 0x01, but 0x01 is a 4-byte opcode that scripts
+   continue past, so it missed most zones in rooms like ST103 (its door
+   triggers among them).  As with section placements, scan the whole area
+   at 4-byte steps instead.  A real zone repeats its type at +20 and has 1
+   at +23; every 0x28 in all rooms that is not a zone (bytes of embedded
+   data tables) fails that test.  Scripts set the same zone from several
+   branches, so identical type + corners are kept once.  Returns the
+   number of zones added. */
+static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
+                              RdtSceneOverlay& ov)
+{
+    int added = 0;
+    for (size_t pc = scd_base; pc + 24 <= scd_end && ov.n_zones < 64; pc += 4) {
+        u8 typ = dec[pc + 2];
+        if (dec[pc] != 0x28 || typ >= 12 || dec[pc + 20] != typ || dec[pc + 23] != 1)
+            continue;
+        RdtFloorZone z;
+        memset(&z, 0, sizeof(z));
+        for (int c = 0; c < 4; c++) {
+            z.x[c] = rd_s16(dec + pc + 4 + c * 4);
+            z.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
+        }
+        z.collision_group = dec[pc + 1];   /* zone slot */
+        z.target_index    = typ;
+        z.kind            = RDT_ZONE_TRIGGER;
+        bool dup = false;
+        for (int i = 0; i < ov.n_zones && !dup; i++) {
+            const RdtFloorZone& o = ov.zones[i];
+            dup = o.kind == RDT_ZONE_TRIGGER && o.target_index == typ &&
+                  memcmp(o.x, z.x, sizeof(z.x)) == 0 && memcmp(o.z, z.z, sizeof(z.z)) == 0;
+        }
+        if (dup) continue;
+        ov.zones[ov.n_zones++] = z;
+        added++;
+    }
+    return added;
+}
 
-    /* NOP/yield group: advance 1 byte */
-    if (op == 0x00 || (op >= 0x19 && op <= 0x1F) || op >= 0x70)
-        return 1;
+/* Enemy spawns (0x5B, 44 bytes).  The handler (0x42A96D) puts a character
+   into the same 0x260-byte character table as 0x20: byte[1] = character
+   slot, byte[2] = type (+0x27), byte[3] (+0x2F), position at +4/+6/+8,
+   rotation at +10, model and animation pointers at +12/+16; the game
+   writes its spawn progress back into the opcode at +0x22.  Found by
+   scanning the script area rather than by the walk, which used to skip
+   the branches that hold them (ST309, ST504 and five more).  Both pointers lie in the room
+   data and differ; mesh data that happens to match has them equal or a
+   slot past the table.
 
-    /* Terminators — only true script-end opcodes */
-    if (op == 0x01 || op == 0x0A)
-        return 0;
+   A cutscene can spawn its enemy off stage and bring it on later: ST100's
+   raptor (thread 6) is spawned at x = z = 0x7000, far outside the room,
+   and appears when the cutscene moves it to (2024, 0, 3008).  Every other
+   spawn in the game lies within +/-15104, so one beyond +/-20000 is shown
+   where its thread first moves it on stage (enemy_spawn_entrance), or
+   left out if it never does. */
+static bool spawn_on_stage(s16 x, s16 z)
+{
+    return x > -20000 && x < 20000 && z > -20000 && z < 20000;
+}
 
-    /* Control-flow markers (1 byte, not terminals) */
-    if (op == 0x04 || op == 0x10 || op == 0x11)
-        return 1;
+/* The first move of a parked 0x5B spawn's enemy onto the stage by the
+   rest of its thread; scd/scd_size are the script area and pc is the
+   spawn's offset in it.  0x22 02 <slot> selects entry <slot> of the
+   character table, the one the spawn filled, as the work target
+   (sub_47416C, work type 2: +0x288 + slot * 0x260).  0x36 then sets x/y/z
+   (fields 3-5, entry +0x20/+0x22/+0x24, where 0x5B puts its position),
+   0x2A one field, and 0x37 the rotation (fields 6-8; field 7 is the Y
+   angle 0x5B sets).  The writes of the first work-target block that
+   leaves the enemy on stage are applied to es. */
+static bool enemy_spawn_entrance(const u8* scd, size_t scd_size, size_t pc, RdtItemSpawn& es)
+{
+    u32 thr[64];
+    int n_thr = 0;
+    u32 first = rd_u32(scd);
+    if (first >= 4 && !(first & 3) && first <= scd_size)
+        for (; n_thr < (int)(first / 4) && n_thr < 64; n_thr++) thr[n_thr] = rd_u32(scd + n_thr * 4);
+    size_t end = scd_thread_end(scd, scd_size, thr, n_thr, pc);
 
-    /* Conditional branches: take skip path (advance 4) */
-    if (op == 0x05 || op == 0x0F) return 4;
+    bool sel = false, moved = false;
+    s16 x = 0, y = 0, z = 0, ry = 0;
+    for (size_t q = pc + 44; ; ) {
+        bool last = q + 8 > end;
+        if (last || scd[q] == 0x22) {
+            if (sel && moved && spawn_on_stage(x, z)) {
+                es.px = x; es.py = y; es.pz = z; es.rot_y = ry;
+                return true;
+            }
+            if (last) return false;
+            sel = scd[q + 1] == 2 && scd[q + 2] == es.slot;
+            moved = false;
+            x = es.px; y = es.py; z = es.pz; ry = es.rot_y;
+        } else if (sel && scd[q] == 0x36) {
+            x = rd_s16(scd + q + 2); y = rd_s16(scd + q + 4); z = rd_s16(scd + q + 6);
+            moved = true;
+        } else if (sel && scd[q] == 0x37) {
+            ry = rd_s16(scd + q + 4);
+        } else if (sel && scd[q] == 0x2A) {
+            s16 v = rd_s16(scd + q + 4);
+            switch (scd[q + 2]) {
+            case 3: x = v; moved = true; break;
+            case 4: y = v; moved = true; break;
+            case 5: z = v; moved = true; break;
+            case 7: ry = v; break;
+            }
+        }
+        int adv = scd_inst_size(scd, scd_size, q);
+        q = adv ? q + (size_t)adv : end;
+    }
+}
 
-    /* Relative jump: follow it */
-    if (op == 0x0C) {
-        if (pc + 4 > dec_size) return 0;
-        s16 jump = rd_s16(dec + pc + 2);
-        /* Return negative of current pos to signal absolute target */
-        /* Actually, return the jump offset encoded as special value */
-        return -1;  /* caller handles */
+static int scan_enemy_spawns(const u8* dec, size_t scd_base, size_t scd_end, u32 base,
+                             size_t dec_size, RdtSceneOverlay& ov)
+{
+    int added = 0;
+    for (size_t pc = scd_base; pc + 44 <= scd_end && ov.n_items < 32; pc += 4) {
+        if (dec[pc] != 0x5B || dec[pc + 1] >= 32) continue;
+        u32 m = rd_u32(dec + pc + 12), a = rd_u32(dec + pc + 16);
+        if (m == a || m < base || a < base || m - base >= dec_size || a - base >= dec_size) continue;
+        RdtItemSpawn is;
+        is.slot     = dec[pc + 1];
+        is.type     = dec[pc + 2];
+        is.anim_set = dec[pc + 3];
+        is.px       = rd_s16(dec + pc + 4);
+        is.py       = rd_s16(dec + pc + 6);
+        is.pz       = rd_s16(dec + pc + 8);
+        is.rot_y    = rd_s16(dec + pc + 10);
+        is.mesh_ptr = m;
+        is.anim_ptr = a;
+        if (!spawn_on_stage(is.px, is.pz) &&
+            !enemy_spawn_entrance(dec + scd_base, scd_end - scd_base, pc - scd_base, is))
+            continue;
+        bool dup = false;
+        for (int i = 0; i < ov.n_items && !dup; i++) {
+            const RdtItemSpawn& o = ov.items[i];
+            dup = o.slot == is.slot && o.type == is.type && o.px == is.px && o.py == is.py &&
+                  o.pz == is.pz && o.rot_y == is.rot_y;
+        }
+        if (dup) continue;
+        ov.items[ov.n_items++] = is;
+        added++;
+    }
+    return added;
+}
+
+/* Camera setups: the model slots each camera shows and hides.  When the
+   game switches to camera N (cam_id of a ptr[3] descriptor) it runs script
+   thread N, which uses 0x48 03 <slot> <1|0> to set or clear the slot's
+   draw bit (sub_42883F; the room draw loop skips slots without it).  A
+   thread runs to the next thread's start or its 0x04. */
+static void scan_camera_views(const u8* dec, size_t scd_base, size_t scd_end,
+                              RdtSceneOverlay& ov)
+{
+    if (scd_base + 4 > scd_end) return;
+    u32 first = rd_u32(dec + scd_base);
+    if (first < 4 || (first & 3) || scd_base + first > scd_end) return;
+    int n_threads = (int)(first / 4);
+
+    for (int c = 0; c < ov.n_cam_threads && ov.n_cam_views < 32; c++) {
+        int id = ov.cam_threads[c].cam_id;
+        if (id == 0 || id >= n_threads) continue;
+        bool seen = false;
+        for (int v = 0; v < ov.n_cam_views && !seen; v++) seen = ov.cam_views[v].cam_id == id;
+        if (seen) continue;
+
+        size_t pc = scd_base + rd_u32(dec + scd_base + id * 4);
+        size_t end = scd_end;
+        for (int t = 0; t < n_threads; t++) {
+            size_t s = scd_base + rd_u32(dec + scd_base + t * 4);
+            if (s > pc && s < end) end = s;
+        }
+        RdtSceneOverlay::CamView cv;
+        memset(&cv, 0, sizeof(cv));
+        cv.cam_id = (u8)id;
+        while (pc + 4 <= end && dec[pc] != 0x04) {
+            if (dec[pc] == 0x48 && dec[pc + 1] == 3 && dec[pc + 2] < 64) {
+                u64 bit = (u64)1 << dec[pc + 2];
+                if (dec[pc + 3] == 1)      { cv.show_mask |= bit; cv.hide_mask &= ~bit; }
+                else if (dec[pc + 3] == 0) { cv.hide_mask |= bit; cv.show_mask &= ~bit; }
+            }
+            int n = scd_inst_size(dec, end, pc);
+            if (n <= 0) break;
+            pc += (size_t)n;
+        }
+        if (cv.hide_mask) ov.cam_views[ov.n_cam_views++] = cv;
     }
 
-    /* Variable: 0x28 */
-    if (op == 0x28) {
-        if (pc + 3 > dec_size) return 0;
-        return scd_op28_size(dec[pc + 2]);
-    }
+    /* In camera order, for cycling through them */
+    for (int i = 1; i < ov.n_cam_views; i++)
+        for (int j = i; j > 0 && ov.cam_views[j].cam_id < ov.cam_views[j - 1].cam_id; j--) {
+            RdtSceneOverlay::CamView t = ov.cam_views[j];
+            ov.cam_views[j] = ov.cam_views[j - 1];
+            ov.cam_views[j - 1] = t;
+        }
+}
 
-    /* Fixed-size table */
-    static const u8 sizes[0x70] = {
-     /* 0x00 */ 1, 4, 4, 4, 0, 4, 4, 4, 4, 8, 0, 4, 0, 4, 4, 4,
-     /* 0x10 */ 0, 0, 4, 4, 4, 8, 4, 4, 4,  1, 1, 1, 1, 1, 1, 1,
-     /* 0x20 */24, 8, 4,32, 8, 4, 4, 4, 0, 8, 8, 8, 4, 4,20, 4,
-     /* 0x30 */ 4, 4, 4, 4, 4, 8, 8, 8, 4, 4,12, 4, 8,12, 4, 8,
-     /* 0x40 */12, 4,20, 8, 8, 8, 8, 4, 4, 4, 4,12,32, 8, 8, 8,
-     /* 0x50 */ 8, 8, 4,12, 4,12,28, 8, 8,20, 8,44, 4, 4,20,12,
-     /* 0x60 */ 4, 4, 8, 8, 4, 4, 4, 8, 8, 4, 8, 4, 4, 4, 4, 4,
-    };
-    if (op < 0x70) return sizes[op];
-    return 1;  /* 0x70+ handled above */
+/* Adds a camera shot unless the same eye and target are already stored.
+   Scripts repeat shots, in several threads and on both sides of a
+   branch, so without this one shot can fill the table. */
+static bool add_camera(RdtSceneOverlay& ov, const RdtCameraEntry& cam)
+{
+    if (ov.n_cameras >= 32) return false;
+    for (int i = 0; i < ov.n_cameras; i++) {
+        const RdtCameraEntry& o = ov.cameras[i];
+        if (o.eye_x == cam.eye_x && o.eye_y == cam.eye_y && o.eye_z == cam.eye_z &&
+            o.tgt_x == cam.tgt_x && o.tgt_y == cam.tgt_y && o.tgt_z == cam.tgt_z)
+            return false;
+    }
+    ov.cameras[ov.n_cameras++] = cam;
+    return true;
 }
 
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
@@ -2876,7 +3301,16 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
         }
     }
 
-    /* ─── Floor Zones (ptr[6]) ─── */
+    /* ─── Floor Zones (ptr[6]) ───
+     * Areas where footsteps play another sound.  The room loader copies
+     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a u32 count, then 20-byte
+     * records of four XZ corners, a level at +16 and a step at +17.  The
+     * footstep player (0x40B8A9, called from the walk code at 0x45ACA0 with
+     * sound 0xB0 or 0xB1) adds 2 * step to the sound when the walker's +0x48
+     * equals the level and its position is inside the quad.  Opcode 0x64
+     * (0x42BE92) sets record N's step, as ST100 does to turn its two zones on.
+     * ST300's one zone switches to sounds 0xB2/0xB3, which the PC build's
+     * sound list for that room (DINO.exe 0x62A4C8) does not have. */
     {
         size_t zo = offs[6];
         if (zo + 4 <= dec_size) {
@@ -2895,6 +3329,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     z.collision_group = dec[rec + 16];
                     z.target_index    = dec[rec + 17];
                     z.flags           = dec[rec + 18];
+                    z.kind            = RDT_ZONE_FLOOR;
                 }
                 found++;
             }
@@ -2959,6 +3394,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     RdtSceneOverlay::CamThread& ct = ov.cam_threads[ov.n_cam_threads++];
                     ct.type = dec[td];
                     ct.cam_id = dec[td + 2];
+                    memcpy(ct.desc, dec + td, 68);
                     for (int c = 0; c < 4; c++) {
                         ct.x[c] = rd_s16(dec + td + 4 + c * 4);
                         ct.z[c] = rd_s16(dec + td + 4 + c * 4 + 2);
@@ -3011,173 +3447,74 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
      *   ...
      *   u32[N-1] = offset to script[N-1]
      * First u32 / 4 gives the script count (table size = first_offset bytes).
-     * Each script is walked linearly, skipping conditional branches.
+     * Each thread is decoded straight through to its end (scd_thread_end),
+     * so both sides of every branch are visited once.
      */
+    scan_section_placements(dec, dec_size, base, offs[5], meta_min, ov);
+    if (ov.n_xforms > 0) found++;
+
     {
         size_t scd_base = offs[5];
-        if (scd_base + 4 > dec_size) goto done;
+        size_t scd_end = dec_size;
+        for (int i = 0; i < 7; i++)
+            if (offs[i] > scd_base && offs[i] < scd_end) scd_end = offs[i];
+        if (scan_trigger_zones(dec, scd_base, scd_end, ov)) found++;
+        if (scan_enemy_spawns(dec, scd_base, scd_end, base, dec_size, ov)) found++;
+        scan_camera_views(dec, scd_base, scd_end, ov);
 
-        u32 first_off = rd_u32(dec + scd_base);
-        if (first_off < 4 || first_off > 0x1000 || (first_off & 3) != 0)
+        const u8* scd = dec + scd_base;
+        size_t scd_size = scd_end - scd_base;
+        if (scd_size < 4) goto done;
+
+        u32 first_off = rd_u32(scd);
+        if (first_off < 4 || first_off > 0x1000 || first_off > scd_size || (first_off & 3) != 0)
             goto done;
 
-        int n_scripts = (int)(first_off / 4);
-        if (n_scripts > 64) n_scripts = 64;
+        /* Thread table, read as the script view reads it (scd_disassemble) */
+        u32 toffs[64];
+        int n_threads = 0;
+        for (int i = 0; i < 64 && (u32)i * 4 < first_off; i++) {
+            u32 t = rd_u32(scd + i * 4);
+            if (t < first_off || t >= scd_size) break;
+            toffs[n_threads++] = t;
+        }
 
-        for (int si = 0; si < n_scripts; si++) {
-            u32 script_rel = rd_u32(dec + scd_base + si * 4);
-            size_t pc = scd_base + script_rel;
-            if (pc >= dec_size) continue;
-
-            int steps = 0;
-            while (pc < dec_size && steps < 2000) {
+        for (int ti = 0; ti < n_threads; ti++) {
+            size_t end = scd_base + scd_thread_end(scd, scd_size, toffs, n_threads, toffs[ti]);
+            size_t pc = scd_base + toffs[ti];
+            while (pc < end) {
                 u8 op = dec[pc];
-
-                /* Relative jump: compute target and follow */
-                if (op == 0x0C) {
-                    if (pc + 4 > dec_size) break;
-                    s16 jump = rd_s16(dec + pc + 2);
-                    size_t target = (size_t)((int)pc + (int)jump);
-                    if (target >= dec_size || target < scd_base) break;
-                    pc = target;
-                    steps++;
-                    continue;
-                }
-
-                int adv = scd_opcode_advance(dec, dec_size, pc);
+                int adv = scd_inst_size(dec, end, pc);
                 if (adv <= 0) break;
 
-                /* ─── Extract spatial data from known opcodes ─── */
+                /* ─── Extract spatial data from known opcodes ───
+                   (0x23 and item-zone section placements are found by
+                   scan_section_placements, and 0x28 zones by
+                   scan_trigger_zones, not by this walk.) */
 
-                /* 0x23: Room model transform (32 bytes) */
-                if (op == 0x23 && pc + 32 <= dec_size && ov.n_xforms < 64) {
-                    u8 slot = dec[pc + 1];
-                    u32 sp_raw = rd_u32(dec + pc + 8);
-                    u32 sec_off;
-                    if (sp_raw >= base && (sp_raw - base) < dec_size)
-                        sec_off = sp_raw - base;
-                    else
-                        sec_off = 0xFFFFFFFF;
-
-                    if (sec_off != 0xFFFFFFFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
-                        u32 sp1 = rd_u32(dec + sec_off) - base;
-                        u32 sp2 = rd_u32(dec + sec_off + 4) - base;
-                        u16 sc1 = rd_u16(dec + sec_off + 8);
-                        u16 sc2 = rd_u16(dec + sec_off + 10);
-                        if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
-                            /* Store ALL 0x23 xforms — no dedup.
-                               Each 0x23 is an independent model slot write.
-                               Conditional branches may write the same slot with
-                               different section/position; we store all because we
-                               don't know which branch executes at runtime.
-                               The exclude list needs every referenced section_off. */
-                            if (ov.n_xforms < 64) {
-                                RdtSectionXform& x = ov.xforms[ov.n_xforms++];
-                                x.section_off   = sec_off;
-                                x.slot           = slot;
-                                x.flags          = dec[pc + 2];
-                                x.render_mode    = dec[pc + 3];
-                                x.ot_depth       = rd_u16(dec + pc + 4);
-                                x.px = rd_s16(dec + pc + 12);
-                                x.py = rd_s16(dec + pc + 14);
-                                x.pz = rd_s16(dec + pc + 16);
-                                x.rx = rd_s16(dec + pc + 18);
-                                x.ry = rd_s16(dec + pc + 20);
-                                x.rz = rd_s16(dec + pc + 22);
-                                found++;
-                            }
-                        }
-                    }
-                }
-
-                /* 0x28: Collision/trigger zone (variable size)
-                   Zone data at +4: 4 × (s16 x, s16 z) = 16 bytes of XZ corners.
-                   Bytes +20..+23 are metadata: type, flags, floor_group, active.
-                   Dedup by slot — conditional branches may rewrite the same slot. */
-                if (op == 0x28 && pc + 20 <= dec_size) {
-                    u8 slot = dec[pc + 1];
-                    u8 typ  = dec[pc + 2];
-                    int sz = scd_op28_size(typ);
-                    if (pc + (size_t)sz <= dec_size && ov.n_zones < 64) {
-                        /* Dedup by slot: first write wins */
-                        bool dup = false;
-                        for (int di = 0; di < ov.n_zones; di++)
-                            if (ov.zones[di].flags == 0x28 &&
-                                ov.zones[di].collision_group == slot) { dup = true; break; }
-                        if (!dup) {
-                            RdtFloorZone& z = ov.zones[ov.n_zones++];
-                            for (int c = 0; c < 4; c++) {
-                                z.x[c] = rd_s16(dec + pc + 4 + c * 4);
-                                z.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
-                            }
-                            z.y = 0;
-                            z.height = 0;
-                            z.collision_group = slot;
-                            z.target_index    = typ;
-                            z.flags           = 0x28;
-                        }
-                        found++;
-                    }
-
-                    /* Type 4 (door): section pointer at opcode+36, model slot at opcode+34.
-                       sub_426DFC positions the section mesh at the door zone center.
-                       Slot 0xFF means no model — skip those. */
-                    if (typ == 4 && pc + 44 <= dec_size) {
-                        u8 mdl_slot = dec[pc + 34];
-                        u32 sec_raw = rd_u32(dec + pc + 36);
-                        u32 sec_off = sec_raw - base;
-                        if (mdl_slot != 0xFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
-                            u32 sp1 = rd_u32(dec + sec_off) - base;
-                            u32 sp2 = rd_u32(dec + sec_off + 4) - base;
-                            u16 sc1 = rd_u16(dec + sec_off + 8);
-                            u16 sc2 = rd_u16(dec + sec_off + 10);
-                            if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
-                                /* Door center = midpoint of corners 0 and 2 */
-                                s16 a0 = rd_s16(dec + pc + 4);
-                                s16 a1 = rd_s16(dec + pc + 6);
-                                s16 a4 = rd_s16(dec + pc + 12);
-                                s16 a5 = rd_s16(dec + pc + 14);
-                                s16 cx = a4 + (s16)((a0 - a4) / 2);
-                                s16 cz = a5 + (s16)((a1 - a5) / 2);
-                                if (ov.n_xforms < 64) {
-                                    RdtSectionXform& x = ov.xforms[ov.n_xforms++];
-                                    x.section_off = sec_off;
-                                    x.slot        = mdl_slot;
-                                    x.flags       = 0;
-                                    x.render_mode = 0;
-                                    x.ot_depth    = 0;
-                                    x.px = cx;
-                                    x.py = 0;
-                                    x.pz = cz;
-                                    x.rx = 0;
-                                    x.ry = 0;
-                                    x.rz = 0;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                /* 0x42: Entity spawn (20 bytes).
-                   byte[1]=slot, byte[2]=type, byte[3]=anim_set, byte[16]=entity_type.
-                   bytes[4..15] are 3 × u32 PSX pointers (mesh EMD, animation, spawn-table).
-                   The entity's POSITION is not in the opcode — it comes from an external
-                   type table in the exe (sub_429D3B), with random placement within a zone.
-                   We record the slot and type but do NOT generate spatial markers. */
-                if (op == 0x42 && pc + 20 <= dec_size && ov.n_enemies < 32) {
-                    RdtEnemySpawn& es = ov.enemies[ov.n_enemies];
-                    es.type  = dec[pc + 1];
-                    es.id    = dec[pc + 2];
+                /* 0x42: Object (20 bytes), handler 0x4284AD.  Fills a 0x7C-byte
+                   object record: byte[1] = record index (0xFF: any free one),
+                   byte[2] = object type (+0x27), byte[3] (+0x2F), position
+                   x/y/z = s16 at +4/+6/+8 (+0x20..), byte[10] = model source
+                   (2: room model, 3: model slot byte[11] & 15), u16 at +12
+                   (+0x2A), u32 at +16 (+0x68). */
+                if (op == 0x42 && pc + 20 <= dec_size && ov.n_enemies < RDT_MAX_OBJECTS) {
+                    RdtEnemySpawn es;
+                    es.type  = dec[pc + 2];
+                    es.id    = dec[pc + 1];
                     es.flags = dec[pc + 3];
-                    es.px    = rd_s16(dec + pc + 6);
-                    es.py    = rd_s16(dec + pc + 8);
-                    es.pz    = rd_s16(dec + pc + 10);
+                    es.px    = rd_s16(dec + pc + 4);
+                    es.py    = rd_s16(dec + pc + 6);
+                    es.pz    = rd_s16(dec + pc + 8);
                     es.rot_y = rd_s16(dec + pc + 12);
-                    /* Only add if position looks valid (not zero/garbage) */
-                    if (es.px != 0 || es.py != 0 || es.pz != 0) {
-                        ov.n_enemies++;
-                        found++;
+                    /* the same object on both sides of a branch is kept once */
+                    bool dup = false;
+                    for (int k = 0; k < ov.n_enemies && !dup; k++) {
+                        const RdtEnemySpawn& o = ov.enemies[k];
+                        dup = o.type == es.type && o.id == es.id && o.flags == es.flags &&
+                              o.px == es.px && o.py == es.py && o.pz == es.pz && o.rot_y == es.rot_y;
                     }
+                    if (!dup) { ov.enemies[ov.n_enemies++] = es; found++; }
                 }
 
                 /* 0x3D: Fog/atmosphere effect (12 bytes) */
@@ -3220,54 +3557,35 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                 }
 
                 /* 0x4C: Camera setup (32 bytes) */
-                if (op == 0x4C && pc + 32 <= dec_size && ov.n_cameras < 32) {
-                    s16 v1 = rd_s16(dec + pc + 2);
-                    s16 v2 = rd_s16(dec + pc + 4);
-                    s16 v3 = rd_s16(dec + pc + 6);
-                    s16 v9 = rd_s16(dec + pc + 18);
-                    s16 v10 = rd_s16(dec + pc + 20);
-                    s16 v11 = rd_s16(dec + pc + 22);
-                    RdtCameraEntry& cam = ov.cameras[ov.n_cameras++];
-                    cam.eye_x = v1;
-                    cam.eye_y = v2;
-                    cam.eye_z = v3;
-                    cam.tgt_x = v9;
-                    cam.tgt_y = v10;
-                    cam.tgt_z = v11;
+                if (op == 0x4C && pc + 32 <= dec_size) {
+                    RdtCameraEntry cam;
+                    cam.eye_x = rd_s16(dec + pc + 2);
+                    cam.eye_y = rd_s16(dec + pc + 4);
+                    cam.eye_z = rd_s16(dec + pc + 6);
+                    cam.tgt_x = rd_s16(dec + pc + 18);
+                    cam.tgt_y = rd_s16(dec + pc + 20);
+                    cam.tgt_z = rd_s16(dec + pc + 22);
                     cam.fov   = (u16)rd_s16(dec + pc + 8);
                     cam.flags = 0;
-                    found++;
+                    if (add_camera(ov, cam)) found++;
                 }
 
-                /* 0x2E: Examine/interact zone (20 bytes)
-                   byte[1]=zone_mask, bytes[4..19]=4 corners (s16 x, s16 z)
-                   Handler stores gs+35=mask, gs+36=ptr to corner data.
-                   Player standing in zone + action button triggers inspect. */
-                if (op == 0x2E && pc + 20 <= dec_size && ov.n_examines < 32) {
-                    u8 mask = dec[pc + 1];
-                    if (mask > 0 && mask < 8) {
-                        RdtExamineZone& ez = ov.examines[ov.n_examines];
-                        ez.mask = mask;
-                        ez.pad  = 0;
-                        bool valid = true;
-                        for (int c = 0; c < 4; c++) {
-                            ez.x[c] = rd_s16(dec + pc + 4 + c * 4);
-                            ez.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
-                            if (ez.x[c] < -30000 || ez.x[c] > 30000 ||
-                                ez.z[c] < -30000 || ez.z[c] > 30000)
-                                valid = false;
-                        }
-                        /* Dedup: skip if identical corners already stored */
-                        bool dup = false;
-                        for (int d = 0; d < ov.n_examines; d++) {
-                            if (ov.examines[d].x[0] == ez.x[0] &&
-                                ov.examines[d].z[0] == ez.z[0] &&
-                                ov.examines[d].x[2] == ez.x[2] &&
-                                ov.examines[d].z[2] == ez.z[2])
-                                { dup = true; break; }
-                        }
-                        if (valid && !dup) { ov.n_examines++; found++; }
-                    }
+                /* 0x2E: Camera eye + target, short form of 0x4C (20 bytes).
+                   Its handler (0x427418) feeds the same camera setters as
+                   0x4C: eye x/y/z at +2/+4/+6 (sub_4220F7), target x/y/z
+                   at +8/+10/+12 (sub_4221B1), with each one's transition
+                   at +16/+18 (0 = cut straight to it). */
+                if (op == 0x2E && pc + 20 <= dec_size) {
+                    RdtCameraEntry cam;
+                    cam.eye_x = rd_s16(dec + pc + 2);
+                    cam.eye_y = rd_s16(dec + pc + 4);
+                    cam.eye_z = rd_s16(dec + pc + 6);
+                    cam.tgt_x = rd_s16(dec + pc + 8);
+                    cam.tgt_y = rd_s16(dec + pc + 10);
+                    cam.tgt_z = rd_s16(dec + pc + 12);
+                    cam.fov   = 0;
+                    cam.flags = 0;
+                    if (add_camera(ov, cam)) found++;
                 }
 
                 /* 0x3A: Scene light source (12 bytes)
@@ -3309,32 +3627,318 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     }
                 }
 
-                /* 0x5B: Item/pickup spawn (44 bytes)
-                   byte[1]=slot, [2]=type, [3]=anim_set
-                   s16[+4]=px, [+6]=py, [+8]=pz, [+10]=rot_y
-                   u32[+12]=mesh_ptr, u32[+16]=anim_ptr */
-                if (op == 0x5B && pc + 44 <= dec_size && ov.n_items < 32) {
-                    RdtItemSpawn& is = ov.items[ov.n_items++];
-                    is.slot     = dec[pc + 1];
-                    is.type     = dec[pc + 2];
-                    is.anim_set = dec[pc + 3];
-                    is.px       = rd_s16(dec + pc + 4);
-                    is.py       = rd_s16(dec + pc + 6);
-                    is.pz       = rd_s16(dec + pc + 8);
-                    is.rot_y    = rd_s16(dec + pc + 10);
-                    is.mesh_ptr = rd_u32(dec + pc + 12);
-                    is.anim_ptr = rd_u32(dec + pc + 16);
-                    found++;
-                }
+                /* 0x5B enemy spawns are found by scan_enemy_spawns */
 
                 pc += (size_t)adv;
-                steps++;
             }
         }
     }
 
 done:
     return found > 0;
+}
+
+/* Zones and collision rects are flat XZ shapes with no height of their
+   own, so the viewer draws each on the floor beneath it.  Taking the most
+   common vertex height picked the ceiling in rooms like ST105, whose
+   ceiling (raw Y -3000) has more vertices than its floor (raw Y 0).  Only
+   upward-facing horizontal faces count as floor; points spread over each
+   zone and rect vote for every floor height beneath them, so a big
+   platform or yard outside the walkable area (ST613) does not win.  Rooms
+   whose overlay covers no floor fall back to the height with the most
+   floor area.
+
+   That gives the room-wide floor.  A shape keeps it when it lies under at
+   least a third of the shape's points, so a desk or counter inside a zone
+   does not lift it.  Otherwise the shape is on another level (ST201's
+   balcony, ST202's platforms) and takes the floor under most of its
+   points, ties going to the height more shapes vote for. */
+static bool xz_in_tri(f32 px, f32 pz, const MeshVert& a, const MeshVert& b,
+                      const MeshVert& c)
+{
+    f32 d1 = (px - b.x) * (a.z - b.z) - (a.x - b.x) * (pz - b.z);
+    f32 d2 = (px - c.x) * (b.z - c.z) - (b.x - c.x) * (pz - c.z);
+    f32 d3 = (px - a.x) * (c.z - a.z) - (c.x - a.x) * (pz - a.z);
+    bool neg = d1 < 0 || d2 < 0 || d3 < 0;
+    bool pos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(neg && pos);
+}
+
+void overlay_floor_heights(const Mesh& mesh, RdtSceneOverlay& ov)
+{
+    ov.floor_y = 0.0f;
+    for (int i = 0; i < 64; i++)  ov.zone_y[i] = 0.0f;
+    for (int i = 0; i < 256; i++) ov.rect_y[i] = 0.0f;
+    for (int i = 0; i < 128; i++) ov.camcut_y[i] = 0.0f;
+    for (int i = 0; i < 32; i++)  ov.cam_thread_y[i] = 0.0f;
+    if (mesh.tri_count <= 0) return;
+    int* ftri = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
+    int* fh   = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
+    if (!ftri || !fh) { free(ftri); free(fh); return; }
+
+    int h_y[256], h_votes[256], h_cnt[256];
+    f32 h_area[256];
+    u8  h_hit[256];
+    int n_h = 0, n_floor = 0;
+
+    /* Mesh verts have Y = -(raw PSX Y), so a face whose normal has +Y faces up */
+    for (int fi = 0; fi < mesh.tri_count; fi++) {
+        const MeshTri& t = mesh.tris[fi];
+        if (t.alt) continue;
+        const MeshVert& a = mesh.verts[t.idx[0]];
+        const MeshVert& b = mesh.verts[t.idx[1]];
+        const MeshVert& c = mesh.verts[t.idx[2]];
+        if (fabsf(a.y - b.y) > 1.0f || fabsf(a.y - c.y) > 1.0f) continue;
+        f32 ny = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+        if (ny <= 0.0f) continue;
+        int y = (int)floorf(a.y + 0.5f);
+        int hi = -1;
+        for (int h = 0; h < n_h && hi < 0; h++)
+            if (h_y[h] == y) hi = h;
+        if (hi < 0) {
+            if (n_h == 256) continue;
+            hi = n_h++;
+            h_y[hi] = y; h_area[hi] = 0.0f; h_votes[hi] = 0;
+        }
+        h_area[hi] += ny;
+        ftri[n_floor] = fi; fh[n_floor] = hi; n_floor++;
+    }
+
+    /* 3x3 sample points across a quad (corners in drawing order);
+       h_cnt[h] = how many of them have floor height h beneath */
+    auto sample = [&](const f32 qx[4], const f32 qz[4]) {
+        static const f32 s[3] = { 0.25f, 0.5f, 0.75f };
+        memset(h_cnt, 0, (size_t)n_h * sizeof(int));
+        for (int u = 0; u < 3; u++)
+            for (int w = 0; w < 3; w++) {
+                f32 x0 = qx[0] + (qx[1] - qx[0]) * s[u], z0 = qz[0] + (qz[1] - qz[0]) * s[u];
+                f32 x1 = qx[3] + (qx[2] - qx[3]) * s[u], z1 = qz[3] + (qz[2] - qz[3]) * s[u];
+                f32 px = x0 + (x1 - x0) * s[w], pz = z0 + (z1 - z0) * s[w];
+                memset(h_hit, 0, (size_t)n_h);
+                for (int k = 0; k < n_floor; k++) {
+                    if (h_hit[fh[k]]) continue;
+                    const MeshTri& t = mesh.tris[ftri[k]];
+                    if (xz_in_tri(px, pz, mesh.verts[t.idx[0]], mesh.verts[t.idx[1]],
+                                  mesh.verts[t.idx[2]])) {
+                        h_hit[fh[k]] = 1;
+                        h_cnt[fh[k]]++;
+                    }
+                }
+            }
+    };
+    auto zone_quad = [&](int i, f32 qx[4], f32 qz[4]) {
+        for (int c = 0; c < 4; c++) { qx[c] = -(f32)ov.zones[i].x[c]; qz[c] = (f32)ov.zones[i].z[c]; }
+    };
+    auto rect_quad = [](s16 x, s16 z, s16 w, s16 h, f32 qx[4], f32 qz[4]) {
+        f32 x0 = -(f32)x, x1 = -(f32)(x + w), z0 = (f32)z, z1 = (f32)(z + h);
+        qx[0] = x0; qx[1] = x1; qx[2] = x1; qx[3] = x0;
+        qz[0] = z0; qz[1] = z0; qz[2] = z1; qz[3] = z1;
+    };
+    f32 qx[4], qz[4];
+    for (int i = 0; i < ov.n_zones; i++) {
+        zone_quad(i, qx, qz);
+        sample(qx, qz);
+        for (int h = 0; h < n_h; h++) h_votes[h] += h_cnt[h];
+    }
+    for (int i = 0; i < ov.n_collisions; i++) {
+        const RdtCollisionRect& r = ov.collisions[i];
+        rect_quad(r.x, r.z, (s16)r.w, (s16)r.h, qx, qz);
+        sample(qx, qz);
+        for (int h = 0; h < n_h; h++) h_votes[h] += h_cnt[h];
+    }
+
+    auto ranks_above = [&](int a, int b) {
+        return h_votes[a] > h_votes[b] || (h_votes[a] == h_votes[b] && h_area[a] > h_area[b]);
+    };
+    int best = -1;
+    for (int h = 0; h < n_h; h++)
+        if (best < 0 || ranks_above(h, best)) best = h;
+    if (best < 0) { free(ftri); free(fh); return; }
+    ov.floor_y = (f32)h_y[best];
+
+    auto pick = [&](const f32 px[4], const f32 pz[4]) -> f32 {
+        sample(px, pz);
+        if (h_cnt[best] >= 3) return ov.floor_y;
+        int p = -1;
+        for (int h = 0; h < n_h; h++)
+            if (h_cnt[h] > 0 && (p < 0 || h_cnt[h] > h_cnt[p] ||
+                                 (h_cnt[h] == h_cnt[p] && ranks_above(h, p)))) p = h;
+        return p >= 0 ? (f32)h_y[p] : ov.floor_y;
+    };
+    for (int i = 0; i < ov.n_zones; i++) {
+        zone_quad(i, qx, qz);
+        ov.zone_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_collisions; i++) {
+        const RdtCollisionRect& r = ov.collisions[i];
+        rect_quad(r.x, r.z, (s16)r.w, (s16)r.h, qx, qz);
+        ov.rect_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_camcuts; i++) {
+        const RdtCameraCutZone& cc = ov.camcuts[i];
+        rect_quad(cc.x, cc.z, cc.w, cc.h, qx, qz);
+        ov.camcut_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_cam_threads; i++) {
+        for (int c = 0; c < 4; c++) { qx[c] = -(f32)ov.cam_threads[i].x[c]; qz[c] = (f32)ov.cam_threads[i].z[c]; }
+        ov.cam_thread_y[i] = pick(qx, qz);
+    }
+    free(ftri); free(fh);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Texture usage  -  which tpage/CLUT/UVs every textured face samples
+ *═══════════════════════════════════════════════════════════════════*/
+static void add_mesh_usage(const Mesh& mesh, TexFaceUse*& out, int& count, int& cap)
+{
+    for (int i = 0; i < mesh.tri_count; i++) {
+        if (count == cap) {
+            int ncap = cap ? cap * 2 : 1024;
+            TexFaceUse* p = (TexFaceUse*)realloc(out, (size_t)ncap * sizeof(TexFaceUse));
+            if (!p) return;
+            out = p; cap = ncap;
+        }
+        const MeshTri& t = mesh.tris[i];
+        TexFaceUse& u = out[count++];
+        u.tpage = t.tpage;
+        u.clut  = t.clut;
+        memcpy(u.uv, t.uv, sizeof(u.uv));
+    }
+}
+
+int collect_texture_usage(const DatArchive& archive, TexFaceUse** out)
+{
+    TexFaceUse* faces = 0;
+    int count = 0, cap = 0;
+
+    for (int i = 0; i < archive.count; i++) {
+        const DatEntry& e = archive.entries[i];
+        if (!(e.y & 0x8000)) continue;
+        if (e.type != DAT_LZSS0 && !is_raw_rdt_entry(e)) continue;
+
+        Buffer dec;
+        if (!dat_entry_payload(e, dec) || dec.size < 0x20) continue;
+        if (is_mips_code_dec(dec.data, dec.size)) continue;
+        u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+
+        RdtLayout layout;
+        bool has_layout = parse_rdt_layout(dec.data, dec.size, base, layout);
+        if (has_layout && layout.section_count > 0) {
+            Mesh mesh;
+            if (parse_rdt_scene_dec(dec.data, dec.size, base, mesh))
+                add_mesh_usage(mesh, faces, count, cap);
+        }
+        if (has_layout && layout.emd_count > 0) {
+            for (int k = 0; k < layout.emd_count && k < RDT_MAX_EMDS; k++) {
+                EmdModel model;
+                if (parse_emd_model_dec(dec.data, dec.size, e.y, e.x, model,
+                                        (int)layout.emds[k].offset))
+                    add_mesh_usage(model.mesh, faces, count, cap);
+            }
+        }
+        if (!has_layout || (layout.section_count == 0 && layout.emd_count == 0)) {
+            Mesh mesh;
+            if (is_door_mesh_entry_dec(dec.data, dec.size, e.y)) {
+                if (parse_door_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            } else if (is_standalone_emd_dec(dec.data, dec.size, base)) {
+                if (parse_standalone_emd_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            }
+        }
+    }
+
+    *out = faces;
+    return count;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Camera shots (ptr[3] descriptors)
+ *
+ *  Each frame the game calls the handler for the active descriptor's
+ *  type (table at 0x645FA8), which builds a target and an eye and passes
+ *  them to sub_423EB7 in that order.  Angles are 4096 to a turn; the
+ *  rotations are libgte's RotMatrixY (rows c,0,s / 0,1,0 / -s,0,c) and
+ *  RotMatrixX (1,0,0 / 0,c,-s / 0,s,c).  The player position is the one
+ *  at +0x20 of the player work (y = floor height, up is negative).
+ *═══════════════════════════════════════════════════════════════════*/
+static f32 cam_rad(f32 a) { return a * 6.2831853f / 4096.0f; }
+
+/* Ry(yaw) * Rx(pitch) * (0,0,d), as sub_5F3700 + ApplyMatrixSV */
+static void cam_orbit(f32 yaw, f32 pitch, f32 d, f32 out[3])
+{
+    f32 sy = sinf(cam_rad(yaw)), cy = cosf(cam_rad(yaw));
+    f32 sp = sinf(cam_rad(pitch)), cp = cosf(cam_rad(pitch));
+    out[0] = sy * cp * d;
+    out[1] = -sp * d;
+    out[2] = cy * cp * d;
+}
+
+static f32 cam_atan2(f32 y, f32 x) { return atan2f(y, x) * 4096.0f / 6.2831853f; }
+
+int rdt_camera_shot(const u8* d, const f32 p[3], f32 eye[3], f32 tgt[3])
+{
+    #define S16(o) ((f32)rd_s16(d + (o)))
+    #define U16(o) ((f32)rd_u16(d + (o)))
+    f32 v[3];
+    switch (d[0]) {
+    case 1: case 34: case 35:      /* fixed: target +0x2C, eye +0x34 */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        eye[0] = S16(0x34); eye[1] = S16(0x36); eye[2] = S16(0x38);
+        return RDT_SHOT_FIXED;
+    case 3:                        /* fixed eye watching the player */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x34); tgt[2] = p[2];
+        eye[0] = S16(0x2C); eye[1] = S16(0x2E); eye[2] = S16(0x30);
+        return RDT_SHOT_TRACKING;
+    case 4: case 31: {             /* orbit a fixed target, facing the player */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        f32 yaw = cam_atan2(tgt[0] - p[0], tgt[2] - p[2]) + 0x800;
+        if (d[0] == 4) {
+            cam_orbit(yaw, cam_atan2(-S16(0x36), U16(0x34)), -S16(0x34), v);
+        } else {
+            f32 dx = p[0] - tgt[0], dy = p[1] - tgt[1], dz = p[2] - tgt[2];
+            cam_orbit(yaw, cam_atan2(S16(0x36), sqrtf(dx * dx + dy * dy + dz * dz)), S16(0x34), v);
+        }
+        for (int k = 0; k < 3; k++) eye[k] = tgt[k] + v[k];
+        return RDT_SHOT_TRACKING;
+    }
+    case 7:                        /* chase at a fixed yaw */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x2C); tgt[2] = p[2];
+        cam_orbit(S16(0x2A), 0, -S16(0x30), v);
+        eye[0] = p[0] + v[0]; eye[1] = p[1] - S16(0x2E); eye[2] = p[2] + v[2];
+        return RDT_SHOT_TRACKING;
+    case 8: case 9:                /* slide along z (8) or x (9) with the player */
+        if (d[0] == 8) { tgt[0] = S16(0x2C); tgt[2] = p[2]; }
+        else           { tgt[0] = p[0];      tgt[2] = S16(0x2C); }
+        tgt[1] = p[1] - S16(0x32);
+        cam_orbit(-S16(0x30), 0, -S16(0x2E), v);
+        eye[0] = tgt[0] + v[0]; eye[1] = tgt[1] - S16(0x34); eye[2] = tgt[2] + v[2];
+        return RDT_SHOT_TRACKING;
+    case 17: case 18: {            /* side-on: one axis fixed, the other follows */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x32); tgt[2] = p[2];
+        eye[1] = tgt[1] - S16(0x34);
+        int a = rd_u16(d + 0x30) & 0xFFF;
+        if (d[0] == 17) {
+            eye[0] = S16(0x2C);
+            eye[2] = (a > 0x400 && a < 0xC00) ? p[2] + S16(0x2E) : p[2] - S16(0x2E);
+        } else {
+            eye[0] = (rd_u16(d + 0x30) & 0x800) ? p[0] + S16(0x2E) : p[0] - S16(0x2E);
+            eye[2] = S16(0x2C);
+        }
+        return RDT_SHOT_TRACKING;
+    }
+    case 26: {                     /* eye on the rail A-B, in line with target and player */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        f32 a[3] = { S16(0x34), S16(0x36), S16(0x38) }, b[3] = { S16(0x3C), S16(0x3E), S16(0x40) };
+        f32 den = (b[0] - a[0]) * (tgt[2] - p[2]) - (b[2] - a[2]) * (tgt[0] - p[0]);
+        f32 t = den != 0 ? ((tgt[0] - p[0]) * (a[2] - p[2]) - (tgt[2] - p[2]) * (a[0] - p[0])) / den : 0;
+        for (int k = 0; k < 3; k++) eye[k] = a[k] + (b[k] - a[k]) * t;
+        return RDT_SHOT_TRACKING;
+    }
+    }
+    #undef S16
+    #undef U16
+    return RDT_SHOT_NONE;   /* 0 and unused types; 10/11/19-21/32/33 shift the previous shot */
 }
 
 #include "emd_glb.inc"
